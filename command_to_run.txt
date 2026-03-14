@@ -1,0 +1,2 @@
+sudo /home/andis/.pyenv/versions/ryu-env3/bin/python train.py
+

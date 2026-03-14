@@ -91,6 +91,10 @@ class SDNRest(app_manager.RyuApp):
             'agent_decisions': []
         }
         
+        # Algorithm selection
+        self.current_algorithm = 'drl' # Default to DRL
+        self.rr_counter = 0 # Round-robin counter
+        
         self.logger.info("="*70)
         self.logger.info("COMPLETE VIP Load Balancing Controller")
         self.logger.info("="*70)
@@ -101,6 +105,11 @@ class SDNRest(app_manager.RyuApp):
         self.logger.info("="*70)
 
         self.monitor_thread = hub.spawn(self._monitor)
+        
+        # External control
+        self.forced_action = None
+        self.forced_action_timestamp = 0
+        
         wsgi.register(SDNRestController, {'sdn_app': self})
 
     # ========================================
@@ -177,6 +186,87 @@ class SDNRest(app_manager.RyuApp):
         """Set server monitor"""
         self.server_monitor = monitor
         self.logger.info("✅ Server Monitor registered")
+
+    # ========================================
+    # ALGORITHM IMPLEMENTATIONS
+    # ========================================
+
+    def select_server(self, client_ip, dpid):
+        """Dispatch to selected algorithm"""
+        if self.current_algorithm == 'round_robin':
+            return self._select_round_robin()
+        elif self.current_algorithm == 'random':
+            return self._select_random()
+        elif self.current_algorithm == 'least_connections':
+            return self._select_least_connections()
+        elif self.current_algorithm == 'external':
+            return self._select_external()
+        else: # Default or 'drl'
+            return self.select_server_with_drl(client_ip, dpid)
+
+    def _select_external(self):
+        """Selection driven by external trainer via /set_action"""
+        # If no valid fresh action (timeout 5s?), fallback to RR
+        if self.forced_action is not None:
+             # Map action index to IP if needed, or assume forced_action is IP
+             # The trainer sends action index usually.
+             server_ips = sorted(list(self.server_pool.keys()))
+             if 0 <= self.forced_action < len(server_ips):
+                 selected_ip = server_ips[self.forced_action]
+                 self.logger.info(f"🎮 External Agent selected: {selected_ip}")
+                 return selected_ip, self.server_pool[selected_ip]
+        
+        # Fallback
+        return self._select_round_robin()
+
+    def _select_round_robin(self):
+        """Round Robin selection"""
+        server_ips = sorted(list(self.server_pool.keys()))
+        if not server_ips:
+             return None, None
+        
+        selected_ip = server_ips[self.rr_counter % len(server_ips)]
+        self.rr_counter += 1
+        
+        self.logger.info(f"🔄 Round Robin selected: {selected_ip}")
+        return selected_ip, self.server_pool[selected_ip]
+
+    def _select_random(self):
+        """Random selection"""
+        import random
+        server_ips = list(self.server_pool.keys())
+        if not server_ips:
+             return None, None
+             
+        selected_ip = random.choice(server_ips)
+        self.logger.info(f"🎲 Random selected: {selected_ip}")
+        return selected_ip, self.server_pool[selected_ip]
+
+    def _select_least_connections(self):
+        """Least Connections selection using monitored metrics"""
+        server_ips = list(self.server_pool.keys())
+        if not server_ips:
+             return None, None
+             
+        # If no monitor, fall back to random
+        if not self.server_monitor:
+            return self._select_random()
+            
+        metrics = self.server_monitor.get_metrics()
+        
+        best_ip = server_ips[0]
+        min_conns = float('inf')
+        
+        for ip in server_ips:
+            # Get connections from metrics (default to 0)
+            conns = metrics.get(ip, {}).get('connections', 0)
+            if conns < min_conns:
+                min_conns = conns
+                best_ip = ip
+        
+        self.logger.info(f"📉 Least Connections selected: {best_ip} (conns={min_conns})")
+        return best_ip, self.server_pool[best_ip]
+
     
     def select_server_with_drl(self, client_ip, dpid):
         """Use DRL agent to select server"""
@@ -224,46 +314,35 @@ class SDNRest(app_manager.RyuApp):
             return selected_ip, self.server_pool[selected_ip]
     
     def _build_agent_state(self, server_metrics, dpid):
-        """Build state for DRL agent (18 features)"""
-        state = []
+        """Build state for DRL agent (9 features: conn, load, delta × 3 servers)"""
+        if not hasattr(self, '_prev_conns'):
+            self._prev_conns = {}
         
-        # Track previous metrics for rate calculations
-        if not hasattr(self, '_prev_metrics'):
-            self._prev_metrics = {}
-        
+        conns = []
+        loads = []
         for server_ip in sorted(self.server_pool.keys()):
-            if server_ip in server_metrics:
-                m = server_metrics[server_ip]
-                prev = self._prev_metrics.get(server_ip, {})
-                
-                # Basic metrics
-                cpu = m.get('cpu', 0.0)
-                memory = m.get('memory', 0.0)
-                rtt = min(m.get('rtt', 0.0) / 0.1, 1.0)  # Normalize: 100ms = 1.0
-                load_score = m.get('load_score', 0.0)
-                
-                # Connection rate (change from previous)
-                curr_conns = m.get('connections', 0)
-                prev_conns = prev.get('connections', curr_conns)
-                conn_rate = min(abs(curr_conns - prev_conns) / 100.0, 1.0)
-                
-                # RTT trend (is it getting better or worse?)
-                curr_rtt = m.get('rtt', 0.0)
-                prev_rtt = prev.get('rtt', curr_rtt)
-                rtt_trend = 0.5 + min(max((prev_rtt - curr_rtt) / 0.05, -0.5), 0.5)
-                
-                state.extend([cpu, memory, rtt, load_score, conn_rate, rtt_trend])
-                
-                # Store for next iteration
-                self._prev_metrics[server_ip] = m.copy()
-            else:
-                state.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.5])
+            m = server_metrics.get(server_ip, {})
+            conns.append(m.get('connections', 0))
+            loads.append(m.get('load_score', 0.0))
         
-        # Ensure fixed size (18)
-        while len(state) < 18:
+        max_conns = max(max(conns), 1)
+        
+        state = []
+        for i, server_ip in enumerate(sorted(self.server_pool.keys())):
+            conn_norm = conns[i] / max_conns
+            load_norm = loads[i]
+            
+            prev_c = self._prev_conns.get(server_ip, conns[i])
+            delta = conns[i] - prev_c
+            delta_norm = max(-1.0, min(1.0, delta / max(max_conns * 0.1, 1)))
+            
+            state.extend([conn_norm, load_norm, delta_norm])
+            self._prev_conns[server_ip] = conns[i]
+        
+        while len(state) < 9:
             state.append(0.0)
         
-        return state[:18]
+        return state[:9]
     
     def handle_vip_packet(self, ev, ip_pkt, tcp_pkt, udp_pkt):
         """Handle VIP packet with DNAT"""
@@ -311,7 +390,7 @@ class SDNRest(app_manager.RyuApp):
             selected_server_ip = self.vip_sessions[session_key]
             self.logger.info(f"📌 Existing session → {selected_server_ip}")
         else:
-            selected_server_ip, server_info = self.select_server_with_drl(client_ip, dpid)
+            selected_server_ip, server_info = self.select_server(client_ip, dpid)
             
             # Only cache if not in training mode
             if not self.training_mode:
@@ -669,6 +748,70 @@ class SDNRestController(ControllerBase):
                 'training_mode': enabled,
                 'sessions_cleared': enabled
             }).encode('utf-8'))
+        except Exception as e:
+            return Response(status=500, body=json.dumps({'error': str(e)}).encode('utf-8'))
+
+    @route('sdrlb', BASE_URL + '/set_algorithm', methods=['POST'])
+    def set_algorithm(self, req, **kwargs):
+        """Set load balancing algorithm"""
+        try:
+            data = json.loads(req.body)
+            algorithm = data.get('algorithm', 'drl')
+            
+            if algorithm not in ['drl', 'round_robin', 'random', 'least_connections', 'external']:
+                return Response(status=400, body=json.dumps({'error': 'Invalid algorithm'}).encode('utf-8'))
+            
+            _app_instance.current_algorithm = algorithm
+            _app_instance.logger.info(f"🔄 Algorithm switched to: {algorithm}")
+            
+            return Response(status=200, body=json.dumps({
+                'algorithm': algorithm,
+                'status': 'updated'
+            }).encode('utf-8'))
+        except Exception as e:
+            return Response(status=500, body=json.dumps({'error': str(e)}).encode('utf-8'))
+
+    @route('sdrlb', BASE_URL + '/set_action', methods=['POST'])
+    def set_action(self, req, **kwargs):
+        """Receive action from external trainer"""
+        try:
+            data = json.loads(req.body)
+            action = data.get('action')
+            
+            if action is None:
+                return Response(status=400, body=json.dumps({'error': 'Missing action'}).encode('utf-8'))
+            
+            _app_instance.forced_action = int(action)
+            _app_instance.forced_action_timestamp = time.time()
+            # _app_instance.logger.info(f"📥 Received external action: {action}")
+            
+            return Response(status=200, body=json.dumps({'status': 'accepted'}).encode('utf-8'))
+        except Exception as e:
+            return Response(status=500, body=json.dumps({'error': str(e)}).encode('utf-8'))
+
+    @route('sdrlb', BASE_URL + '/reset_episode', methods=['POST'])
+    def reset_episode(self, req, **kwargs):
+        """Reset controller state for a new training episode"""
+        try:
+            # Clear VIP sessions
+            _app_instance.vip_sessions.clear()
+            
+            # Reset stats
+            _app_instance.vip_stats['total_requests'] = 0
+            _app_instance.vip_stats['arp_requests'] = 0
+            _app_instance.vip_stats['server_selections'] = {}
+            _app_instance.vip_stats['agent_decisions'] = []
+            
+            # Reset forced action
+            _app_instance.forced_action = None
+            _app_instance.forced_action_timestamp = 0
+            
+            # Reset RR counter
+            _app_instance.rr_counter = 0
+            
+            _app_instance.logger.info("🔄 Episode state reset")
+            
+            return Response(status=200, body=json.dumps({'status': 'episode_reset'}).encode('utf-8'))
         except Exception as e:
             return Response(status=500, body=json.dumps({'error': str(e)}).encode('utf-8'))
     
